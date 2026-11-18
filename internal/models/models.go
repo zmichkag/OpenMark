@@ -9,6 +9,10 @@ import (
 // PumperMode определяет алгоритм прокачки кодов в принтер
 type PumperMode string
 
+type FieldMapper interface {
+	SetFieldMap(fieldMap map[string]string)
+}
+
 const (
 	ModeFastSingle   PumperMode = "fast_single"   // Реактивный под фотодатчик (по 1 шт)
 	ModeRibbonBuffer PumperMode = "ribbon_buffer" // Программная петля упреждения на ленте

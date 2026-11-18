@@ -203,7 +203,6 @@
         .alert-badge.ok {
             background: rgba(40, 167, 69, 0.12);
             border: 1px solid rgba(40, 167, 69, 0.4);
-            color: #6edff6;
             color: var(--success);
             cursor: default;
         }
@@ -507,12 +506,24 @@
             .replace(/'/g, '&#39;');
     }
 
+    function parsePrinterSettings(rawSettings) {
+        if (!rawSettings) return {};
+        if (typeof rawSettings === 'string') {
+            try {
+                return JSON.parse(rawSettings) || {};
+            } catch (e) {
+                return {};
+            }
+        }
+        return typeof rawSettings === 'object' ? { ...rawSettings } : {};
+    }
+
     function switchTab(tabId) {
         document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         document.getElementById(tabId).classList.add('active');
         if (tabId === 'settings') loadSettingsData();
-        if (tabId === 'control') updateControlTargets();
+        if (tabId === 'control' && typeof updateControlTargets === 'function') updateControlTargets();
     }
 
     async function fetchSystemInfo() {
@@ -636,12 +647,12 @@
             }
 
             if (!tasks || tasks.length === 0) {
-                updateTopBars([]); // <-- ВЫЗОВ ПРИ ПУСТОМ СПИСКЕ
+                updateTopBars([]);
                 container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">Активных заданий нет</div>';
                 return;
             }
 
-            updateTopBars(tasks); // <-- ВЫЗОВ ДЛЯ ОТРИСОВКИ АЛЕРТОВ И ПИЛЛСОВ
+            updateTopBars(tasks);
 
             container.innerHTML = tasks.map(t => {
                 const line = window.linesMap[t.line_id] || {};
@@ -835,7 +846,6 @@
                 </div>`;
             }).join('');
         } catch (err) {
-            // Если сеть или сервер упали — зажигаем красный индикатор в шапке
             const netDot = document.getElementById('net-dot');
             const netText = document.getElementById('net-text');
             if (netDot && netText) {
@@ -999,7 +1009,9 @@
             window.linesMap = {};
             lines.forEach(l => window.linesMap[l.id] = l);
             window.printersMap = {};
-            allPrinters.forEach(p => window.printersMap[p.id] = p);
+            allPrinters.forEach(p => {
+                window.printersMap[p.id] = p;
+            });
             window.scannersMap = {};
             allScanners.forEach(s => window.scannersMap[s.id] = s);
 
@@ -1008,6 +1020,11 @@
             assignments.forEach(a => {
                 printerLineMap[a.printer_id] = a.line_id;
                 printerRoleMap[a.printer_id] = a.role;
+            });
+
+            allPrinters.forEach(p => {
+                if (printerLineMap[p.id]) p.line_id = printerLineMap[p.id];
+                if (printerRoleMap[p.id]) p.role = printerRoleMap[p.id];
             });
 
             const lineOptions = lines.map(l => `<option value="${l.id}">${l.name}</option>`).join('');
@@ -1151,11 +1168,13 @@
             document.getElementById('p_line_assign').value = p.line_id || '';
             document.getElementById('p_role_assign').value = p.role || 'PRIMARY';
 
-            const s = p.settings || {};
+            const s = parsePrinterSettings(p.settings);
             document.getElementById('p_bcs_device').value = s.bcs_device || '';
             document.getElementById('p_capture_weight').checked = !!s.capture_weight;
             document.getElementById('p_bizerba_conveyor').checked = !!s.conveyor;
             document.getElementById('p_record_gxnet').checked = !!s.record_gxnet;
+
+            renderMappingRows(s);
 
             document.getElementById('printer_modal_title').innerText = 'Редактировать принтер';
         } else {
@@ -1164,8 +1183,19 @@
             document.getElementById('p_port').value = '9100';
             document.getElementById('p_driver').value = 'videojet';
             document.getElementById('p_active').checked = true;
+            document.getElementById('p_pumper_mode').value = 'fast_single';
+            document.getElementById('p_buffer_limit').value = '30';
+            document.getElementById('p_lead_loop').value = '5';
             document.getElementById('p_line_assign').value = defaultLineId || '';
             document.getElementById('p_role_assign').value = 'PRIMARY';
+
+            document.getElementById('p_bcs_device').value = '';
+            document.getElementById('p_capture_weight').checked = false;
+            document.getElementById('p_bizerba_conveyor').checked = false;
+            document.getElementById('p_record_gxnet').checked = false;
+
+            renderMappingRows({});
+
             document.getElementById('printer_modal_title').innerText = 'Добавить принтер';
         }
 
@@ -1192,7 +1222,10 @@
             is_active: document.getElementById('p_active').checked
         };
 
-        const settings = {};
+        // Сохраняем прочие кастомные ключи settings (например, trace_wire), если редактируем существующий принтер
+        const existingPrinter = id && window.printersMap[id] ? window.printersMap[id] : null;
+        const settings = parsePrinterSettings(existingPrinter?.settings);
+
         if (driverType === 'bizerba') {
             settings.bcs_device = document.getElementById('p_bcs_device').value.trim() || 'GLPMax';
             settings.capture_weight = document.getElementById('p_capture_weight').checked;
@@ -1203,11 +1236,11 @@
         const fieldMap = collectMappingRows();
         if (Object.keys(fieldMap).length > 0) {
             settings.field_map = fieldMap;
+        } else {
+            delete settings.field_map;
         }
 
-        if (Object.keys(settings).length > 0) {
-            body.settings = settings;
-        }
+        body.settings = settings;
 
         const saveRes = await fetch('/api/printers/add', {
             method: 'POST',
@@ -1343,20 +1376,22 @@
 
     function addMappingRow(sourceKey = '', targetField = '') {
         const container = document.getElementById('mapping_rows_container');
+        if (!container) return;
         const row = document.createElement('div');
         row.className = 'mapping-row';
-        row.style = 'display:grid; grid-template-columns: 1fr 20px 1fr 28px; gap:5px; align-items:center;';
+        row.style.cssText = 'display:grid; grid-template-columns: 1fr 20px 1fr 28px; gap:5px; align-items:center;';
         row.innerHTML = `
-        <input type="text" class="map-src" placeholder="Поле 1С (date01)" value="${sourceKey}" style="padding:5px; font-size:0.8rem;">
-        <span style="text-align:center; color:#666;">→</span>
-        <input type="text" class="map-dst" placeholder="Поле принтера (BM[18])" value="${targetField}" style="padding:5px; font-size:0.8rem;">
-        <button type="button" class="btn" style="padding:4px; color:var(--danger); border-color:#444;" onclick="this.parentElement.remove()">✕</button>
-    `;
+            <input type="text" class="map-src" placeholder="Поле 1С (date01)" value="${esc(sourceKey)}" style="padding:5px; font-size:0.8rem;">
+            <span style="text-align:center; color:#666;">→</span>
+            <input type="text" class="map-dst" placeholder="Поле принтера (BM[18])" value="${esc(targetField)}" style="padding:5px; font-size:0.8rem;">
+            <button type="button" class="btn" style="padding:4px; color:var(--danger); border-color:#444;" onclick="this.parentElement.remove()">✕</button>
+        `;
         container.appendChild(row);
     }
 
     function renderMappingRows(settingsObj) {
         const container = document.getElementById('mapping_rows_container');
+        if (!container) return;
         container.innerHTML = '';
         const map = (settingsObj && settingsObj.field_map) ? settingsObj.field_map : {};
         const keys = Object.keys(map);
@@ -1369,8 +1404,8 @@
     function collectMappingRows() {
         const fieldMap = {};
         document.querySelectorAll('#mapping_rows_container .mapping-row').forEach(row => {
-            const src = row.querySelector('.map-src').value.trim();
-            const dst = row.querySelector('.map-dst').value.trim();
+            const src = row.querySelector('.map-src')?.value.trim();
+            const dst = row.querySelector('.map-dst')?.value.trim();
             if (src && dst) {
                 fieldMap[src] = dst;
             }

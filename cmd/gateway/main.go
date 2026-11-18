@@ -17,14 +17,7 @@ import (
 	"rovnoMark/internal/api"
 	"rovnoMark/internal/brand"
 	"rovnoMark/internal/core"
-	"rovnoMark/internal/drivers/bizerba"
-	"rovnoMark/internal/drivers/extserver"
-	"rovnoMark/internal/drivers/markem"
-	"rovnoMark/internal/drivers/markem_async"
-	"rovnoMark/internal/drivers/savema"
 	scannerdrivers "rovnoMark/internal/drivers/scanners"
-	"rovnoMark/internal/drivers/valentine"
-	"rovnoMark/internal/drivers/videojet"
 	"rovnoMark/internal/storage"
 	"rovnoMark/internal/version"
 
@@ -131,25 +124,11 @@ func runApp(ctx context.Context, port int, dataDir string, mode storage.StorageM
 	}
 
 	for _, cfg := range savedPrinters {
-		switch cfg.DriverType {
-		case "savema":
-			manager.AddPrinter(cfg, savema.New(cfg.IP, cfg.Port))
-		case "videojet":
-			manager.AddPrinter(cfg, videojet.New(cfg.IP, cfg.Port))
-		case "valentine_nice":
-			manager.AddPrinter(cfg, valentine.NewNiceLabelDriver(cfg.ID, cfg.IP, cfg.Port))
-		case "valentine_native":
-			manager.AddPrinter(cfg, valentine.NewNativeDriver(cfg.IP, cfg.Port, cfg.Settings))
-		case "markem":
-			manager.AddPrinter(cfg, markem.New(cfg.IP, cfg.Port, "Actor1"))
-		case "markem_async":
-			manager.AddPrinter(cfg, markem_async.New(cfg.IP, cfg.Port, "Actor1"))
-		case "ext_server", "nicelabel_http":
-			manager.AddPrinter(cfg, extserver.New(cfg.IP, cfg.Port))
-		case "bizerba":
-			manager.AddPrinter(cfg, bizerba.CreateDriver(cfg, store))
-		default:
-			slog.Warn("Неизвестный тип драйвера оборудования", "type", cfg.DriverType, "id", cfg.ID)
+		drv := core.CreateDriver(cfg, store)
+		if drv != nil {
+			manager.AddPrinter(cfg, drv)
+		} else {
+			slog.Warn("Неизвестный тип драйвера оборудования или ошибка создания", "type", cfg.DriverType, "id", cfg.ID)
 		}
 	}
 

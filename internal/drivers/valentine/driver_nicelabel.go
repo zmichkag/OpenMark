@@ -4,24 +4,28 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
+var bmIndexRegex = regexp.MustCompile(`(?i)^(?:bm\[)?(\d+)\]?$`)
+
 type NiceLabelDriver struct {
-	Name        string        // Имя макета / PLU
-	ID          int           // ID принтера в базе данных
-	Address     string        // IP-адрес принтера (например, 192.168.x.x)
-	Port        int           // RAW TCP порт (9100)
-	Timeout     time.Duration // Сетевой таймаут сокета
-	conn        net.Conn      // Активная монопольная TCP-сессия
-	mu          sync.Mutex    // Мьютекс для защиты сокета при многопоточном вызове
-	curTemplate string        // Активный выбранный шаблон
-	lastCount   int           // Виртуальный нарастающий итог для фронтенда/1С
-	lastRawFBBC int           // Последнее физическое значение из регистра FBBC
-	isPumping   bool          // Флаг активности реалтайм-насоса кодов
+	Name        string            // Имя макета / PLU
+	ID          int               // ID принтера в базе данных
+	Address     string            // IP-адрес принтера (например, 192.168.x.x)
+	Port        int               // RAW TCP порт (9100)
+	Timeout     time.Duration     // Сетевой таймаут сокета
+	conn        net.Conn          // Активная монопольная TCP-сессия
+	mu          sync.Mutex        // Мьютекс для защиты сокета при многопоточном вызове
+	curTemplate string            // Активный выбранный шаблон
+	lastCount   int               // Виртуальный нарастающий итог для фронтенда/1С
+	lastRawFBBC int               // Последнее физическое значение из регистра FBBC
+	isPumping   bool              // Флаг активности реалтайм-насоса кодов
+	fieldMap    map[string]string // Тут хранится маппинг полей для шаблона.
 }
 
 func NewNiceLabelDriver(id int, ip string, port int) *NiceLabelDriver {
@@ -39,6 +43,60 @@ func NewNiceLabelDriver(id int, ip string, port int) *NiceLabelDriver {
 		lastRawFBBC: 0,
 		isPumping:   false,
 	}
+}
+
+// SetFieldMap потокобезопасно обновляет таблицу соответствия полей.
+func (d *NiceLabelDriver) SetFieldMap(m map[string]string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.fieldMap = make(map[string]string, len(m))
+	for k, v := range m {
+		d.fieldMap[k] = v
+	}
+}
+
+func (d *NiceLabelDriver) getFieldMapCopy() map[string]string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := make(map[string]string, len(d.fieldMap))
+	for k, v := range d.fieldMap {
+		cp[k] = v
+	}
+	return cp
+}
+
+// BuildStaticFieldsPayload формирует CVPL-команды обновления переменных макета.
+func (d *NiceLabelDriver) BuildStaticFieldsPayload(staticFields map[string]string) []byte {
+	fMap := d.getFieldMapCopy()
+	var buf strings.Builder
+
+	for k, val := range staticFields {
+		idx, ok := resolveBMIndex(fMap, k, 0)
+		if !ok {
+			continue
+		}
+		// Формат команды CVPL: [SOH]BM[<номер>]<значение>[ETB]
+		fmt.Fprintf(&buf, "\x01BM[%d]%s\x17", idx, val)
+	}
+	return []byte(buf.String())
+}
+
+// BuildBatchCodeCommand формирует команду записи DataMatrix для PrintBatchIndexed.
+func (d *NiceLabelDriver) BuildBatchCodeCommand(fieldName string, code string) []byte {
+	fMap := d.getFieldMapCopy()
+	lookupKey := fieldName
+	if strings.TrimSpace(lookupKey) == "" {
+		lookupKey = "datamatrix"
+	}
+	// Сначала пробуем найти по переданному fieldName, затем по "datamatrix", фоллбэк -> 20
+	idx, ok := resolveBMIndex(fMap, lookupKey, 0)
+	if !ok && !strings.EqualFold(lookupKey, "datamatrix") {
+		idx, _ = resolveBMIndex(fMap, "datamatrix", 20)
+	}
+	if idx == 0 {
+		idx = 20
+	}
+	return []byte(fmt.Sprintf("\x01BM[%d]%s\x17", idx, code))
 }
 
 // InitSession проверяет/поднимает сокет, сбрасывает счетчики и конфигурирует режим датчика перед стартом

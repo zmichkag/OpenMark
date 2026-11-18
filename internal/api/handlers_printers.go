@@ -5,13 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"rovnoMark/internal/core"
-	"rovnoMark/internal/drivers/bizerba"
-	"rovnoMark/internal/drivers/extserver"
-	"rovnoMark/internal/drivers/markem"
-	"rovnoMark/internal/drivers/markem_async"
-	"rovnoMark/internal/drivers/savema"
-	"rovnoMark/internal/drivers/valentine"
-	"rovnoMark/internal/drivers/videojet"
 	"rovnoMark/internal/models"
 	"strconv"
 	"strings"
@@ -131,27 +124,14 @@ func (s *Server) handlePrintersAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.ID = int(newID)
 
-	switch cfg.DriverType {
-	case "savema":
-		s.manager.AddPrinter(cfg, savema.New(cfg.IP, cfg.Port))
-	case "videojet":
-		s.manager.AddPrinter(cfg, videojet.New(cfg.IP, cfg.Port))
-	case "valentine_nice":
-		s.manager.AddPrinter(cfg, valentine.NewNiceLabelDriver(cfg.ID, cfg.IP, cfg.Port))
-	case "valentine_native":
-		s.manager.AddPrinter(cfg, valentine.NewNativeDriver(cfg.IP, cfg.Port, cfg.Settings))
-	case "markem":
-		s.manager.AddPrinter(cfg, markem.New(cfg.IP, cfg.Port, "Actor1"))
-	case "markem_async":
-		s.manager.AddPrinter(cfg, markem_async.New(cfg.IP, cfg.Port, "Actor1"))
-	case "ext_server", "nicelabel_http":
-		s.manager.AddPrinter(cfg, extserver.New(cfg.IP, cfg.Port))
-	case "bizerba":
-		s.manager.AddPrinter(cfg, bizerba.CreateDriver(cfg, s.store))
-	default:
+	// Создаем драйвер через централизованную фабрику
+	drv := core.CreateDriver(cfg, s.store)
+	if drv == nil {
 		sendJSONError(w, http.StatusBadRequest, "Неизвестный тип драйвера: "+cfg.DriverType)
 		return
 	}
+
+	s.manager.AddPrinter(cfg, drv)
 
 	sendJSON(w, http.StatusOK, map[string]interface{}{"printer_id": newID})
 }
