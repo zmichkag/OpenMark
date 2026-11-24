@@ -383,30 +383,70 @@ func (d *NativeDriver) readLoop(conn net.Conn, stopChan chan struct{}, done chan
 	}
 }
 
-// handleSingleFrame обрабатывает строго один завершённый кадр TD по фронту Print -> Wait
+// handleSingleFrame обрабатывает строго один завершённый кадр (TD или HS)
 func (d *NativeDriver) handleSingleFrame(frame string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if strings.Contains(frame, "Error") || strings.Contains(frame, "Fehler") {
+	// Убираем ведущие байты keep-alive (0x00) и SOH (0x01) перед проверкой префиксов
+	frame = strings.TrimLeft(frame, "\x00\x01")
+
+	// 1. Проверка аппаратных ошибок на всех языках (EN / DE / RU)
+	if strings.Contains(frame, "Error") ||
+		strings.Contains(frame, "Fehler") ||
+		strings.Contains(frame, "Ошибка") {
 		slog.Error("VALENTIN-NATIVE: Аппаратная ошибка на контроллере", "display", frame)
 		return
 	}
 
-	// Игнорируем полностью пустые кадры бланков ("TD\"                ")
-	if !strings.Contains(frame, "R 0") && !strings.Contains(frame, "D 0") {
+	// 2. Обработка машинных кадров синхронизации (HSStart / HSProgress / HSDone)
+	// Если принтер шлёт HSDone-<PLU>-<N>, это самый надёжный сигнал завершения цикла, не зависящий от языка меню.
+	if strings.HasPrefix(frame, "HSDone-") {
+		if !d.d1Counted {
+			d.d1Counted = true
+			d.isPrinting = false
+			d.incrementPrinted("HSDone")
+		}
+		return
+	}
+	if strings.HasPrefix(frame, "HSStart-") || strings.HasPrefix(frame, "HSProgress-") {
+		d.isPrinting = true
 		return
 	}
 
-	// Сброс защёлки D=1 при старте следующего задания (D 00000)
-	if strings.Contains(frame, "D 00000") {
+	// 3. Обработка дисплейных кадров TD (EN: R/D, RU: З/С)
+	if !strings.HasPrefix(frame, "TD") {
+		return
+	}
+
+	hasRemainingZero := strings.Contains(frame, "R 0") || strings.Contains(frame, "З 0")
+	hasDoneZero := strings.Contains(frame, "D 0") || strings.Contains(frame, "С 0")
+
+	// Игнорируем промежуточные кадры перерисовки без счётчиков ("TD\"3328 Печать \nЗ С \";1;16;0")
+	if !hasRemainingZero && !hasDoneZero {
+		return
+	}
+
+	isDone0 := strings.Contains(frame, "D 00000") || strings.Contains(frame, "С 00000")
+	isDone1 := strings.Contains(frame, "D 00001") || strings.Contains(frame, "С 00001")
+
+	// Сброс защёлки при старте следующего задания (С 00000 / D 00000)
+	if isDone0 {
 		d.d1Counted = false
 	}
 
-	if strings.Contains(frame, "Print") {
+	isPrintState := strings.Contains(frame, "Print") ||
+		strings.Contains(frame, "Печать") ||
+		strings.Contains(frame, "Druck")
+
+	isWaitState := strings.Contains(frame, "Wait") ||
+		strings.Contains(frame, "Подожди") ||
+		strings.Contains(frame, "Warten")
+
+	if isPrintState {
 		d.isPrinting = true
-		// Если на ходу (без перехода в Wait) зафиксирован сход D 00001 — считаем сразу
-		if strings.Contains(frame, "D 00001") && !d.d1Counted {
+		// Если на ходу зафиксирован сход С 00001 / D 00001 — считаем сразу
+		if isDone1 && !d.d1Counted {
 			d.d1Counted = true
 			d.isPrinting = false
 			d.incrementPrinted("Print(D=1)")
@@ -414,8 +454,8 @@ func (d *NativeDriver) handleSingleFrame(frame string) {
 		return
 	}
 
-	if strings.Contains(frame, "Wait") {
-		if (d.isPrinting || strings.Contains(frame, "D 00001")) && !d.d1Counted {
+	if isWaitState {
+		if (d.isPrinting || isDone1) && !d.d1Counted {
 			d.incrementPrinted("Print->Wait")
 		}
 		d.isPrinting = false
