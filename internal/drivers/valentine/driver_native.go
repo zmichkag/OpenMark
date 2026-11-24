@@ -128,7 +128,7 @@ func (d *NativeDriver) SelectTemplate(template string, staticFields map[string]s
 		"template", d.curTemplate,
 		"fields_count", len(staticFields),
 	)
-
+	// Включаем HS ответы, если не поддерживаются - просто проглотит команды.
 	if err := d.writeRawCmdNoLock("FHM---rSEP1", "FHM"); err != nil {
 		return fmt.Errorf("сбой FHM: %w", err)
 	}
@@ -136,6 +136,17 @@ func (d *NativeDriver) SelectTemplate(template string, staticFields map[string]s
 
 	if err := d.writeRawCmdNoLock("FHA---r2", "FHA"); err != nil {
 		return fmt.Errorf("сбой FHA: %w", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	// Включаем трансляцию дисплея TD и событий статуса в текущий TCP-сокет (в ОЗУ, без записи во Flash)
+	if err := d.writeRawCmdNoLock("FCRA--r2-------", "FCRA 2 (TD Auto-Send)"); err != nil {
+		return fmt.Errorf("сбой FCRA: %w", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	if err := d.writeRawCmdNoLock("FCRB--r0001----", "FCRB 0001 (Event Channel)"); err != nil {
+		return fmt.Errorf("сбой FCRB: %w", err)
 	}
 	time.Sleep(10 * time.Millisecond)
 
@@ -170,6 +181,7 @@ func (d *NativeDriver) SelectTemplate(template string, staticFields map[string]s
 	d.totalPrinted = 0
 	d.inFlight = 0
 	d.isPrinting = false
+	d.d1Counted = false
 	return nil
 }
 
