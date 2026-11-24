@@ -101,6 +101,7 @@ func (d *NativeDriver) InitSession(fieldName string, maxQueue int, staticFields 
 	d.totalPrinted = 0
 	d.inFlight = 0
 	d.isPrinting = false
+	d.d1Counted = false
 
 	slog.Info("VALENTIN-NATIVE: Сессия инициализирована, TD-ридер активен", "addr", d.Address, "trace_wire", d.TraceWire)
 	return nil
@@ -539,6 +540,7 @@ func (d *NativeDriver) ClearQueue() error {
 	d.inFlight = 0
 	d.isPrinting = false
 	d.curTemplate = ""
+	d.d1Counted = false
 
 	slog.Info("VALENTIN-NATIVE: Очередь и макет V1.53 успешно сброшены в ОЗУ")
 	return nil
