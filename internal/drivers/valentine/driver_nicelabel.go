@@ -180,7 +180,25 @@ func (d *NiceLabelDriver) SelectTemplate(template string, staticFields map[strin
 		d.closeConnNoLock()
 		return fmt.Errorf("сбой отправки FMB: %w", err)
 	}
-	time.Sleep(30 * time.Millisecond) // Пауза на переключение графического буфера в RAM
+	time.Sleep(30 * time.Millisecond)
+
+	// --- ШАГ 1.1: Включаем трансляцию дисплея TD и событий в ОЗУ (для сбора телеметрии) ---
+	for _, extraCmd := range []struct {
+		desc string
+		cmd  string
+	}{
+		{"Enable TD Auto-Send (FCRA)", "FCRA--r2-------"},
+		{"Enable Event Channel (FCRB)", "FCRB--r0001----"},
+	} {
+		payload := []byte(fmt.Sprintf("%c%s%c", SOH, extraCmd.cmd, ETB))
+		_ = d.conn.SetWriteDeadline(time.Now().Add(d.Timeout))
+		d.traceCommand(extraCmd.desc, payload)
+		if _, err := d.conn.Write(payload); err != nil {
+			d.closeConnNoLock()
+			return fmt.Errorf("сбой отправки %s: %w", extraCmd.cmd, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// --- ШАГ 2: Записываем дату производства в поле 18 (BM[18]) ---
 	if dateProd != "" {
@@ -303,7 +321,7 @@ func (d *NiceLabelDriver) PrintBatchIndexedMode(fieldName string, startIndex int
 	return d.PrintBatchIndexed(fieldName, startIndex, codes)
 }
 
-// GetCurrentPrintCount опрашивает FBBC с коротким дедлайном и защитой от скачков
+// GetCurrentPrintCount опрашивает FBBC и попутно сливает/логирует спонтанные TD/HS кадры из сокета
 func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -314,64 +332,88 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		}
 	}
 
-	// Короткий дедлайн 45мс для исключения зависания тикера
-	_ = d.conn.SetDeadline(time.Now().Add(45 * time.Millisecond))
+	// Отправляем запрос счетчика FBBC
+	_ = d.conn.SetWriteDeadline(time.Now().Add(45 * time.Millisecond))
 	cmd := fmt.Sprintf("%cFBBC--w%c", SOH, ETB)
-
 	if _, err := d.conn.Write([]byte(cmd)); err != nil {
 		d.closeConnNoLock()
 		return strconv.Itoa(d.lastCount), err
 	}
 
-	buf := make([]byte, 128)
-	n, err := d.conn.Read(buf)
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return strconv.Itoa(d.lastCount), nil
+	// Вычитываем всё, что накопилось в сокете (и спонтанные TD/HS, и ответ на FBBC)
+	var allData []byte
+	buf := make([]byte, 512)
+	for {
+		_ = d.conn.SetReadDeadline(time.Now().Add(35 * time.Millisecond))
+		n, err := d.conn.Read(buf)
+		if n > 0 {
+			allData = append(allData, buf[:n]...)
+			// Если прочитали меньше буфера — скорее всего, сокет на данный момент пуст
+			if n < len(buf) {
+				break
+			}
+			continue
 		}
-		d.closeConnNoLock()
-		return strconv.Itoa(d.lastCount), err
-	}
-
-	rawResponse := string(buf[:n])
-
-	if strings.Contains(rawResponse, "TD\"") || !strings.Contains(rawResponse, "A") {
-		return strconv.Itoa(d.lastCount), nil
-	}
-
-	cleanResp := strings.Trim(rawResponse, string([]byte{SOH, byte(ETB), '\r', '\n', ' '}))
-	aIdx := strings.Index(cleanResp, "A")
-	if aIdx == -1 {
-		return strconv.Itoa(d.lastCount), nil
-	}
-
-	numStr := ""
-	for _, char := range cleanResp[aIdx+1:] {
-		if char >= '0' && char <= '9' {
-			numStr += string(char)
-		} else {
-			break
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break // Таймаут чтения — норма, всё вычитали
+			}
+			d.closeConnNoLock()
+			return strconv.Itoa(d.lastCount), err
 		}
+		break
 	}
 
-	if numStr == "" {
+	if len(allData) == 0 {
 		return strconv.Itoa(d.lastCount), nil
 	}
 
-	rawCount, _ := strconv.Atoi(numStr)
-
-	// Защита одометра:
-	if rawCount < d.lastRawFBBC {
-		d.lastRawFBBC = rawCount
-		return strconv.Itoa(d.lastCount), nil
-	}
-
-	if rawCount > d.lastRawFBBC {
-		delta := rawCount - d.lastRawFBBC
-		if delta < 10 {
-			d.lastCount += delta
+	// Разбираем поток по кадрам (разделитель ETB = 0x17)
+	rawFrames := strings.Split(string(allData), string(byte(ETB)))
+	for _, rawFrame := range rawFrames {
+		frame := strings.TrimLeft(rawFrame, "\x00\x01\r\n ")
+		if frame == "" {
+			continue
 		}
-		d.lastRawFBBC = rawCount
+
+		// 1. Логируем дисплейные и HS-события для анализа работы линий
+		if strings.HasPrefix(frame, "TD") || strings.HasPrefix(frame, "HS") {
+			safeAscii := strings.ReplaceAll(frame, "\x1d", "<GS>")
+			safeAscii = strings.ReplaceAll(safeAscii, "\n", "\\n")
+			safeAscii = strings.ReplaceAll(safeAscii, "\r", "\\r")
+
+			slog.Debug("VALENTIN-NL-WIRE-IN",
+				"printer_id", d.ID,
+				"addr", d.Address,
+				"ascii", safeAscii,
+				"hex", fmt.Sprintf("%x", []byte(frame)),
+			)
+			continue
+		}
+
+		// 2. Ищем ответ на FBBC (начинается с 'A' и цифр, например A00005)
+		if strings.HasPrefix(frame, "A") {
+			numStr := ""
+			for _, char := range frame[1:] {
+				if char >= '0' && char <= '9' {
+					numStr += string(char)
+				} else {
+					break
+				}
+			}
+			if numStr != "" {
+				rawCount, _ := strconv.Atoi(numStr)
+				if rawCount < d.lastRawFBBC {
+					d.lastRawFBBC = rawCount
+				} else if rawCount > d.lastRawFBBC {
+					delta := rawCount - d.lastRawFBBC
+					if delta < 10 {
+						d.lastCount += delta
+					}
+					d.lastRawFBBC = rawCount
+				}
+			}
+		}
 	}
 
 	return strconv.Itoa(d.lastCount), nil
