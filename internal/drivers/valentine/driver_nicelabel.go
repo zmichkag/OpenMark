@@ -189,6 +189,8 @@ func (d *NiceLabelDriver) SelectTemplate(template string, staticFields map[strin
 	}{
 		{"Enable TD Auto-Send (FCRA)", "FCRA--r2-------"},
 		{"Enable Event Channel (FCRB)", "FCRB--r0001----"},
+		{"FHM---rSEP1", "FHM---rSEP1"},
+		{"FHA---r2", "FHA---r2"},
 	} {
 		payload := []byte(fmt.Sprintf("%c%s%c", SOH, extraCmd.cmd, ETB))
 		_ = d.conn.SetWriteDeadline(time.Now().Add(d.Timeout))
