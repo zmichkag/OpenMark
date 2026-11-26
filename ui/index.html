@@ -532,7 +532,7 @@
             if (!res.ok) return;
             const data = await res.json();
 
-            const brandName = data.brand?.name || 'RovnoMark';
+            const brandName = data.brand?.name || 'OpenMark';
             const buildVer = data.build?.version || 'dev';
             const gitCommit = data.build?.git_commit ? ` (${data.build.git_commit.slice(0, 7)})` : '';
 
@@ -540,8 +540,8 @@
             const titleEl = document.getElementById('app-title');
             const verBadgeEl = document.getElementById('app-version-badge');
 
-            if (titleEl) titleEl.innerText = brandName;
-            if (verBadgeEl) verBadgeEl.innerText = `v${buildVer}${gitCommit}`;
+            if (titleEl) titleEl.innerText = brandName
+            if (verBadgeEl) verBadgeEl.innerText = `${buildVer}${gitCommit}`;
         } catch (e) {
             console.warn('Не удалось загрузить версию системы:', e);
             document.getElementById('app-title').innerText = 'RovnoMark';
