@@ -88,7 +88,9 @@ type pw02Deduplicator struct {
 func newPW02Deduplicator() *pw02Deduplicator {
 	return &pw02Deduplicator{
 		seen: make(map[string]deduplicationEntry),
-		ttl:  5 * time.Second,
+		// Кольцевой счётчик PW02 на Bizerba оборачивается каждые 15 (GLP) или 31 (GLM-E) упаковок,
+		// поэтому окно дедупликации удерживаем коротким (1с), чтобы не отбрасывать живые упаковки.
+		ttl: 1 * time.Second,
 	}
 }
 
@@ -542,7 +544,12 @@ func (d *Driver) startPreparedSession() error {
 }
 
 // runSession обслуживает очередь марок в одном закреплённом COM-потоке.
-// Сессия открывает канал E, принимает PV01/PW05 и устанавливает следующую марку.
+// Двухфазный цикл конвейера Bizerba:
+//
+//	Фаза 1 (PW05 / PSV_PCK): упаковка прошла взвешивание и захватила текущий код из GT03/GT04
+//	  в буфер печати контроллера — переносим марку в inFlight[handle] и немедленно грузим следующую.
+//	Фаза 2 (PV01/PV04/PV05 / PSV_DATA): аппликатор нанёс этикетку — подтверждаем марку из
+//	  inFlight[PW02], сохраняем вес PD00 и обновляем lastPrinted.
 func (d *Driver) runSession(s *markSession, capacity int, staticFields map[string]string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -577,7 +584,9 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 	defer conn.Close()
 
 	var pending []queuedMark
-	var active *queuedMark
+	var loaded *queuedMark
+	inFlight := make(map[string]queuedMark)
+	var inFlightOrder []string
 	dedup := newPW02Deduplicator()
 
 	serialReg := d.equipment.mapping.SerialField
@@ -600,7 +609,7 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 	}
 
 	installNext := func() error {
-		if active != nil || len(pending) == 0 {
+		if loaded != nil || len(pending) == 0 {
 			return nil
 		}
 		next := pending[0]
@@ -611,8 +620,34 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 		if err := sendWrite(conn, "A!"+cryptoReg, next.crypto, d.timeout); err != nil {
 			return fmt.Errorf("ошибка установки поля Bizerba %s: %w", cryptoReg, err)
 		}
-		active = &next
+		loaded = &next
 		return nil
+	}
+
+	removeInFlight := func(handle string) {
+		delete(inFlight, handle)
+		for idx, h := range inFlightOrder {
+			if h == handle {
+				inFlightOrder = append(inFlightOrder[:idx], inFlightOrder[idx+1:]...)
+				break
+			}
+		}
+	}
+
+	usedSlots := func() int {
+		used := len(pending) + len(inFlight)
+		if loaded != nil {
+			used++
+		}
+		return used
+	}
+
+	resetQueueState := func() {
+		dedup.reset()
+		loaded = nil
+		pending = nil
+		inFlight = make(map[string]queuedMark)
+		inFlightOrder = nil
 	}
 
 	for {
@@ -626,11 +661,7 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 						req.resp <- sessionResponse{err: fmt.Errorf("сессия передачи марок Bizerba не инициализирована")}
 						continue
 					}
-					used := len(pending)
-					if active != nil {
-						used++
-					}
-					free := capacity - used
+					free := capacity - usedSlots()
 					if free < len(req.marks) {
 						req.resp <- sessionResponse{err: fmt.Errorf("в очереди Bizerba свободно место для %d из %d марок", free, len(req.marks))}
 						continue
@@ -644,22 +675,18 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 						return
 					}
 				case "free":
-					used := len(pending)
-					if active != nil {
-						used++
-					}
-					req.resp <- sessionResponse{value: capacity - used}
+					req.resp <- sessionResponse{value: capacity - usedSlots()}
 				case "call":
 					req.resp <- sessionResponse{err: req.call(conn)}
 				case "prepare":
-					dedup.reset()
+					resetQueueState()
 					err := d.updateStaticFieldsOn(conn, req.prepared.staticFields)
 					if err == nil {
 						capacity = req.prepared.capacity
 					}
 					req.resp <- sessionResponse{err: err}
 				case "stop", "close":
-					dedup.reset()
+					resetQueueState()
 					_ = clearMarkFields()
 					err := sendWrite(conn, "A!GWC3", "0", d.timeout)
 					req.resp <- sessionResponse{err: err}
@@ -683,17 +710,59 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 		}
 
 		if status == bcsStatusTimeout {
-			if active == nil {
+			if loaded == nil && len(inFlight) == 0 {
 				time.Sleep(10 * time.Millisecond)
 			}
 			continue
 		}
 
+		// Фаза 1: PW05 (PSV_PCK) — упаковка прошла взвешивание и забрала текущий код из GT03/GT04.
+		// Немедленно фиксируем привязку handle -> марка в inFlight и грузим следующую марку на устройство,
+		// не дожидаясь доезда упаковки до аппликатора (PV04).
 		if hasField(payload, "PW05") {
-			slog.Debug("Bizerba: получено сервисное сообщение PW05 (пропуск)", "packet", payload)
+			handle, hasHandle := bizerbaFieldValue(payload, "PW05")
+			handle = strings.TrimSpace(handle)
+			if !hasHandle || handle == "" {
+				slog.Warn("Bizerba: PW05 без корректного номера упаковки пропущен", "packet", payload)
+				continue
+			}
+			if loaded == nil {
+				slog.Debug("Bizerba: PW05 получен при пустых регистрах GT03/GT04", "handle", handle, "packet", payload)
+				continue
+			}
+
+			if _, exists := inFlight[handle]; exists {
+				slog.Warn("Bizerba: перезапись неподтверждённой записи inFlight при повторном PW05", "handle", handle)
+				removeInFlight(handle)
+			}
+			inFlight[handle] = *loaded
+			inFlightOrder = append(inFlightOrder, handle)
+			loaded = nil
+
+			if err := installNext(); err != nil {
+				s.setError(err)
+				_ = sendWrite(conn, "A!GWC3", "0", d.timeout)
+				return
+			}
+			// Если очередь pending исчерпана, сразу очищаем GT03/GT04: текущая марка уже захвачена
+			// контроллером Bizerba по PW05, очистка защищает от печати дубля при холостом проходе.
+			if loaded == nil && len(pending) == 0 {
+				if err := clearMarkFields(); err != nil {
+					slog.Warn("Не удалось очистить поля марки после захвата последней марки по PW05", "err", err)
+				}
+			}
 			continue
 		}
 
+		// PW07 — отмена/сброс цикла упаковки на Bizerba; оставляем запись в inFlight до возможного PV05,
+		// чтобы сохранить синхронизацию при последующем завершении цикла.
+		if hasField(payload, "PW07") {
+			handle, _ := bizerbaFieldValue(payload, "PW07")
+			slog.Debug("Bizerba: получен сигнал отмены/сброса PW07", "handle", strings.TrimSpace(handle), "packet", payload)
+			continue
+		}
+
+		// Фаза 2: PV01 / PV04 / PV05 (PSV_DATA) — подтверждение аппликации/печати и фиксация веса.
 		msgType := ""
 		switch {
 		case hasField(payload, "PV01"):
@@ -706,7 +775,7 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 			continue
 		}
 
-		if active == nil {
+		if len(inFlight) == 0 && loaded == nil {
 			continue
 		}
 
@@ -718,8 +787,22 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 		}
 
 		if !dedup.shouldProcess(handle, msgType, time.Now()) {
-			slog.Debug("Bizerba: повторное сообщение для PW02 в окне 5с пропущено", "handle", handle, "type", msgType)
+			slog.Debug("Bizerba: повторное сообщение для PW02 в окне дедупликации пропущено", "handle", handle, "type", msgType)
 			continue
+		}
+
+		mark, matchedInFlight := inFlight[handle]
+		fallbackFromLoaded := false
+		if !matchedInFlight {
+			// Fallback для режимов без предварительного PW05 (например, одиночная ручная печать на GLP):
+			// если inFlight пуст, но марка загружена в loaded, подтверждаем её напрямую.
+			if len(inFlight) == 0 && loaded != nil {
+				mark = *loaded
+				fallbackFromLoaded = true
+			} else {
+				slog.Warn("Bizerba: получен PV-отчёт для неизвестного PW02 (пропуск)", "handle", handle, "type", msgType, "packet", payload)
+				continue
+			}
 		}
 
 		weight := ""
@@ -740,40 +823,120 @@ func (d *Driver) runSession(s *markSession, capacity int, staticFields map[strin
 			weight = "0"
 		}
 
+		if matchedInFlight {
+			removeInFlight(handle)
+		} else if fallbackFromLoaded {
+			loaded = nil
+		}
+
 		if weight != "" && d.equipment.recordWeight != nil {
-			if err := d.equipment.recordWeight(active.index, active.code, weight); err != nil {
-				slog.Error("Не удалось сохранить вес напечатанной марки", "mark", active.code, "weight", weight, "err", err)
+			if err := d.equipment.recordWeight(mark.index, mark.code, weight); err != nil {
+				slog.Error("Не удалось сохранить вес напечатанной марки", "mark", mark.code, "weight", weight, "err", err)
 			}
 		}
 
 		d.mu.Lock()
-		d.lastPrinted = active.index
-		d.mu.Unlock()
-		active = nil
-
-		if err := installNext(); err != nil {
-			s.setError(err)
-			_ = sendWrite(conn, "A!GWC3", "0", d.timeout)
-			return
+		if mark.index > d.lastPrinted {
+			d.lastPrinted = mark.index
 		}
+		d.mu.Unlock()
 
-		if active == nil && len(pending) == 0 {
-			if err := clearMarkFields(); err != nil {
-				slog.Warn("Не удалось очистить поля марки в конце очереди Bizerba", "err", err)
+		if fallbackFromLoaded {
+			if err := installNext(); err != nil {
+				s.setError(err)
+				_ = sendWrite(conn, "A!GWC3", "0", d.timeout)
+				return
+			}
+			if loaded == nil && len(pending) == 0 {
+				if err := clearMarkFields(); err != nil {
+					slog.Warn("Не удалось очистить поля марки в конце очереди Bizerba", "err", err)
+				}
 			}
 		}
 	}
 }
 
-// hasField проверяет наличие поля в пакете протокола Bizerba.
-func hasField(packet, field string) bool {
-	for _, part := range strings.Split(packet, "|") {
-		part = strings.TrimSpace(part)
-		if part == field || strings.TrimPrefix(strings.TrimPrefix(part, "A!"), "A?") == field {
-			return true
+// parseGxNetPacket разбирает пакет Bizerba в обоих форматах:
+//  1. Табличный (Old: Header - Data): "!PV04|PW02|GW09|GL19|PD00|PD04|LX02 5|2|3840|KG|-3|1000|KG|-3|1000"
+//  2. Парный (New: HeaderData):     "A!PV01|PW02|6|PW00|0|GW09|2|GL16|0|PD00|KG;-3;200|LX02"
+func parseGxNetPacket(packet string) (fields map[string]string, hasHeader map[string]bool) {
+	fields = make(map[string]string)
+	hasHeader = make(map[string]bool)
+
+	trimmed := strings.TrimSpace(packet)
+	if trimmed == "" {
+		return fields, hasHeader
+	}
+
+	if spaceIdx := strings.IndexByte(trimmed, ' '); spaceIdx > 0 {
+		headerPart := trimmed[:spaceIdx]
+		dataPart := strings.TrimSpace(trimmed[spaceIdx+1:])
+		if strings.Contains(headerPart, "|") && strings.Contains(dataPart, "|") {
+			headers := strings.Split(headerPart, "|")
+			values := strings.Split(dataPart, "|")
+			valIdx := 0
+			for _, rawH := range headers {
+				h := normalizeFieldName(rawH)
+				if h == "" {
+					continue
+				}
+				hasHeader[h] = true
+				if strings.HasPrefix(h, "PV") || strings.HasPrefix(h, "LX") || strings.HasPrefix(h, "XV") {
+					continue
+				}
+				if valIdx >= len(values) {
+					break
+				}
+				if isTripletField(h) && valIdx+2 < len(values) {
+					fields[h] = strings.TrimSpace(values[valIdx]) + ";" +
+						strings.TrimSpace(values[valIdx+1]) + ";" +
+						strings.TrimSpace(values[valIdx+2])
+					valIdx += 3
+				} else {
+					fields[h] = strings.TrimSpace(values[valIdx])
+					valIdx++
+				}
+			}
+			return fields, hasHeader
 		}
 	}
-	return false
+
+	parts := strings.Split(trimmed, "|")
+	for i, part := range parts {
+		name := normalizeFieldName(part)
+		if name == "" {
+			continue
+		}
+		hasHeader[name] = true
+		if i+1 < len(parts) {
+			fields[name] = strings.TrimSpace(parts[i+1])
+		}
+	}
+	return fields, hasHeader
+}
+
+func normalizeFieldName(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "A!")
+	s = strings.TrimPrefix(s, "A?")
+	s = strings.TrimPrefix(s, "!")
+	s = strings.TrimPrefix(s, "?")
+	return s
+}
+
+func isTripletField(field string) bool {
+	switch field {
+	case "PD00", "PD01", "PD02", "PD03", "PD04", "PD05", "PD06", "PD07", "PD08", "PD09":
+		return true
+	default:
+		return false
+	}
+}
+
+// hasField проверяет наличие поля в пакете протокола Bizerba.
+func hasField(packet, field string) bool {
+	_, hasHeader := parseGxNetPacket(packet)
+	return hasHeader[normalizeFieldName(field)]
 }
 
 // bizerbaWeight извлекает PD00 и преобразует представление «KG;степень;целое» в килограммы.
@@ -805,14 +968,9 @@ func bizerbaWeight(packet string) (string, error) {
 
 // bizerbaFieldValue возвращает значение, следующее за именем поля в пакете Bizerba.
 func bizerbaFieldValue(packet, field string) (string, bool) {
-	parts := strings.Split(packet, "|")
-	for i, part := range parts {
-		name := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(part), "A!"), "A?")
-		if name == field && i+1 < len(parts) {
-			return strings.TrimSpace(parts[i+1]), true
-		}
-	}
-	return "", false
+	fields, _ := parseGxNetPacket(packet)
+	val, ok := fields[normalizeFieldName(field)]
+	return val, ok && val != ""
 }
 
 // formatScaledInteger форматирует целое с десятичной степенью без потери точности.
@@ -853,7 +1011,7 @@ func (d *Driver) PrintBatchIndexed(_ string, startIndex int, codes []string) (in
 		}
 
 		if i == 0 {
-			activeGTIN = parsed.GTIN // 14 цифр GTIN из первой марки[cite: 269]
+			activeGTIN = parsed.GTIN // 14 цифр GTIN из первой марки
 		} else if parsed.GTIN != activeGTIN {
 			return 0, fmt.Errorf("в партии обнаружен чужой GTIN на марке #%d: %s (ожидался %s)", i, parsed.GTIN, activeGTIN)
 		}
@@ -973,7 +1131,7 @@ func (d *Driver) GetBufferFreeSpace() (int, error) {
 	return s.request(sessionRequest{kind: "free"})
 }
 
-// GetLastPrintedIndex возвращает индекс последней марки, подтверждённой пакетом PV01 или PW05.
+// GetLastPrintedIndex возвращает индекс последней марки, подтверждённой пакетом PV01, PV04 или PV05.
 func (d *Driver) GetLastPrintedIndex() (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -1003,7 +1161,7 @@ func (d *Driver) GetQueueCapacity(string) (string, error) { return "0", nil }
 // GetPrintSpeed возвращает заглушку: скорость печати через BCS пока не читается.
 func (d *Driver) GetPrintSpeed() (string, error) { return "N/A", nil }
 
-// GetCurrentPrintCount возвращает заглушку: количество определяется по пакетам PV01/PW05.
+// GetCurrentPrintCount возвращает заглушку: количество определяется по пакетам PV01/PV04/PV05.
 func (d *Driver) GetCurrentPrintCount() (string, error) { return "N/A", nil }
 
 // firstField ищет первое непустое значение по одному из допустимых имён поля.
