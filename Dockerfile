@@ -2,6 +2,13 @@
 
 FROM golang:1.25-alpine AS builder
 
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+ARG BRAND_NAME=OpenMark
+ARG VENDOR=AstraForce
+ARG SUPPORT_URL=
+
 WORKDIR /app
 
 COPY go.mod go.sum ./
@@ -14,7 +21,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-w -s" -o /bin/marking-service ./cmd/gateway
+    CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w \
+      -X 'rovnoMark/internal/version.Version=${VERSION}' \
+      -X 'rovnoMark/internal/version.GitCommit=${GIT_COMMIT}' \
+      -X 'rovnoMark/internal/version.BuildDate=${BUILD_DATE}' \
+      -X 'rovnoMark/internal/brand.Name=${BRAND_NAME}' \
+      -X 'rovnoMark/internal/brand.Vendor=${VENDOR}' \
+      -X 'rovnoMark/internal/brand.SupportURL=${SUPPORT_URL}'" \
+    -o /bin/marking-service ./cmd/gateway
 
 FROM alpine:latest
 
