@@ -3,7 +3,7 @@ FROM golang:1.25-alpine AS builder
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_DATE=unknown
-ARG BRAND_NAME=OpenMark
+ARG BRAND_NAME=Astra
 ARG VENDOR=AstraForce
 ARG SUPPORT_URL=sup
 
