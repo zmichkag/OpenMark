@@ -126,7 +126,7 @@ func (d *NiceLabelDriver) InitSession(fieldName string, maxQueue int, staticFiel
 	return nil
 }
 
-// SelectTemplate атомарно загружает макет и записывает статические поля по шагам
+// SelectTemplate атомарно загружает макет, включает трансляцию TD/HS в ОЗУ и записывает статические поля по шагам
 func (d *NiceLabelDriver) SelectTemplate(template string, staticFields map[string]string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -172,6 +172,26 @@ func (d *NiceLabelDriver) SelectTemplate(template string, staticFields map[strin
 		"text01", text01,
 	)
 
+	// --- ШАГ 0: Активируем протокол хоста и трансляцию TD/событий в ОЗУ (до загрузки макета) ---
+	for _, initCmd := range []struct {
+		desc string
+		cmd  string
+	}{
+		{"Host Mode (FHM)", "FHM---rSEP1"},
+		{"Host Activate (FHA)", "FHA---r2"},
+		{"Enable TD Auto-Send (FCRA)", "FCRA--r2-------"},
+		{"Enable Event Channel (FCRB)", "FCRB--r0001----"},
+	} {
+		payload := []byte(fmt.Sprintf("%c%s%c", SOH, initCmd.cmd, ETB))
+		_ = d.conn.SetWriteDeadline(time.Now().Add(d.Timeout))
+		d.traceCommand(initCmd.desc, payload)
+		if _, err := d.conn.Write(payload); err != nil {
+			d.closeConnNoLock()
+			return fmt.Errorf("сбой отправки %s: %w", initCmd.cmd, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// --- ШАГ 1: Выбираем макет из Flash (FMB) ---
 	cmdFMB := []byte(fmt.Sprintf("%cFMB---r%s%c", SOH, d.curTemplate, ETB))
 	_ = d.conn.SetWriteDeadline(time.Now().Add(d.Timeout))
@@ -181,26 +201,6 @@ func (d *NiceLabelDriver) SelectTemplate(template string, staticFields map[strin
 		return fmt.Errorf("сбой отправки FMB: %w", err)
 	}
 	time.Sleep(30 * time.Millisecond)
-
-	// --- ШАГ 1.1: Включаем трансляцию дисплея TD и событий в ОЗУ (для сбора телеметрии) ---
-	for _, extraCmd := range []struct {
-		desc string
-		cmd  string
-	}{
-		{"Enable TD Auto-Send (FCRA)", "FCRA--r2-------"},
-		{"Enable Event Channel (FCRB)", "FCRB--r0001----"},
-		{"FHM---rSEP1", "FHM---rSEP1"},
-		{"FHA---r2", "FHA---r2"},
-	} {
-		payload := []byte(fmt.Sprintf("%c%s%c", SOH, extraCmd.cmd, ETB))
-		_ = d.conn.SetWriteDeadline(time.Now().Add(d.Timeout))
-		d.traceCommand(extraCmd.desc, payload)
-		if _, err := d.conn.Write(payload); err != nil {
-			d.closeConnNoLock()
-			return fmt.Errorf("сбой отправки %s: %w", extraCmd.cmd, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 
 	// --- ШАГ 2: Записываем дату производства в поле 18 (BM[18]) ---
 	if dateProd != "" {
@@ -323,7 +323,7 @@ func (d *NiceLabelDriver) PrintBatchIndexedMode(fieldName string, startIndex int
 	return d.PrintBatchIndexed(fieldName, startIndex, codes)
 }
 
-// GetCurrentPrintCount опрашивает FBBC и попутно сливает/логирует спонтанные TD/HS кадры из сокета
+// GetCurrentPrintCount опрашивает FBBC и попутно сливает/логирует все входящие кадры из сокета
 func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -334,7 +334,6 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		}
 	}
 
-	// Отправляем запрос счетчика FBBC
 	_ = d.conn.SetWriteDeadline(time.Now().Add(45 * time.Millisecond))
 	cmd := fmt.Sprintf("%cFBBC--w%c", SOH, ETB)
 	if _, err := d.conn.Write([]byte(cmd)); err != nil {
@@ -342,7 +341,6 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		return strconv.Itoa(d.lastCount), err
 	}
 
-	// Вычитываем всё, что накопилось в сокете (и спонтанные TD/HS, и ответ на FBBC)
 	var allData []byte
 	buf := make([]byte, 512)
 	for {
@@ -350,7 +348,6 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		n, err := d.conn.Read(buf)
 		if n > 0 {
 			allData = append(allData, buf[:n]...)
-			// Если прочитали меньше буфера — скорее всего, сокет на данный момент пуст
 			if n < len(buf) {
 				break
 			}
@@ -358,7 +355,7 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		}
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				break // Таймаут чтения — норма, всё вычитали
+				break
 			}
 			d.closeConnNoLock()
 			return strconv.Itoa(d.lastCount), err
@@ -370,7 +367,6 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 		return strconv.Itoa(d.lastCount), nil
 	}
 
-	// Разбираем поток по кадрам (разделитель ETB = 0x17)
 	rawFrames := strings.Split(string(allData), string(byte(ETB)))
 	for _, rawFrame := range rawFrames {
 		frame := strings.TrimLeft(rawFrame, "\x00\x01\r\n ")
@@ -378,22 +374,7 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 			continue
 		}
 
-		// 1. Логируем дисплейные и HS-события для анализа работы линий
-		if strings.HasPrefix(frame, "TD") || strings.HasPrefix(frame, "HS") {
-			safeAscii := strings.ReplaceAll(frame, "\x1d", "<GS>")
-			safeAscii = strings.ReplaceAll(safeAscii, "\n", "\\n")
-			safeAscii = strings.ReplaceAll(safeAscii, "\r", "\\r")
-
-			slog.Debug("VALENTIN-NL-WIRE-IN",
-				"printer_id", d.ID,
-				"addr", d.Address,
-				"ascii", safeAscii,
-				"hex", fmt.Sprintf("%x", []byte(frame)),
-			)
-			continue
-		}
-
-		// 2. Ищем ответ на FBBC (начинается с 'A' и цифр, например A00005)
+		// Ответ на FBBC (начинается с 'A' и цифр)
 		if strings.HasPrefix(frame, "A") {
 			numStr := ""
 			for _, char := range frame[1:] {
@@ -415,7 +396,20 @@ func (d *NiceLabelDriver) GetCurrentPrintCount() (string, error) {
 					d.lastRawFBBC = rawCount
 				}
 			}
+			continue
 		}
+
+		// Всё остальное (TD, HS, ошибки и любые другие ответы) пишем в дебаг-лог
+		safeAscii := strings.ReplaceAll(frame, "\x1d", "<GS>")
+		safeAscii = strings.ReplaceAll(safeAscii, "\n", "\\n")
+		safeAscii = strings.ReplaceAll(safeAscii, "\r", "\\r")
+
+		slog.Debug("VALENTIN-NL-WIRE-IN",
+			"printer_id", d.ID,
+			"addr", d.Address,
+			"ascii", safeAscii,
+			"hex", fmt.Sprintf("%x", []byte(frame)),
+		)
 	}
 
 	return strconv.Itoa(d.lastCount), nil
