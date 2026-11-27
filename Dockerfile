@@ -1,44 +1,38 @@
-# Stage 1: Сборка бинарного файла
 FROM golang:1.25-alpine AS builder
+
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+ARG BRAND_NAME=OpenMark
+ARG VENDOR=AstraForce
+ARG SUPPORT_URL=sup
 
 WORKDIR /app
 
-# 1. Копируем манифесты зависимостей
 COPY go.mod go.sum ./
-
-# 2. Скачиваем модули с монтированием кэша
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
-# 3. Предкомпиляция SQLite в кэш для моментальных повторных сборщиков
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go build modernc.org/sqlite
-
-# 4. Копируем исходный код приложения
 COPY . .
-
-# 5. Собираем статический бинарник
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-w -s" -o /bin/marking-service ./main.go
+    CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w \
+      -X 'rovnoMark/internal/version.Version=${VERSION}' \
+      -X 'rovnoMark/internal/version.GitCommit=${GIT_COMMIT}' \
+      -X 'rovnoMark/internal/version.BuildDate=${BUILD_DATE}' \
+      -X 'rovnoMark/internal/brand.Name=${BRAND_NAME}' \
+      -X 'rovnoMark/internal/brand.Vendor=${VENDOR}' \
+      -X 'rovnoMark/internal/brand.SupportURL=${SUPPORT_URL}'" \
+    -o /bin/marking-service ./cmd/gateway
 
-# Stage 2: Минималистичный финальный образ
-FROM alpine:latest
+FROM scratch
 
-RUN apk --no-cache add ca-certificates tzdata
 ENV TZ=Europe/Moscow
 
-# Рабочая директория корня приложения (НЕ /app/data!)
-WORKDIR /app
-
-# Переносим скомпилированный бинарный файл
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /bin/marking-service /bin/marking-service
 
-# Создаем папку под базы данных внутри /app
-RUN mkdir -p /app/data
+EXPOSE 8000
 
-EXPOSE 8001
-VOLUME ["/app/data"]
-
-# Запуск с явным указанием каталога баз через флаг
-CMD ["-data-dir", "/app/data", "-port", "8001", "--debug", "true"]
+CMD ["/bin/marking-service", "--port", "8000", "--debug", "--data-dir", "/app/data"]

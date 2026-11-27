@@ -1,8 +1,12 @@
 services:
   rovnomark:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: rovnomark-app-test
-    # Флаги можно передавать прямо здесь или оставить дефолты из CMD
     command: ["/bin/marking-service", "--port", "8000", "--debug", "--data-dir", "/app/data"]
     ports:
       - "8000:8000"
